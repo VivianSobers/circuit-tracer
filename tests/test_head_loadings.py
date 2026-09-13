@@ -274,3 +274,48 @@ def test_a_batched_cache_is_refused():
 
     with pytest.raises(ValueError, match="a batch of 2"):
         FrozenRun.from_model(BatchedModel(), torch.zeros(2, N_POS, dtype=torch.long))
+
+
+def test_path_head_loadings_match_splitting_one_layer_at_a_time():
+    """The single sweep is only worth having if it reproduces the per-layer split exactly."""
+    from circuit_tracer.attribution.head_loadings import path_head_loadings
+
+    model, run, graph = make_model(), make_run(), make_graph(*GRAPH_ARGS)
+    swept = path_head_loadings(model, graph, run, target_node=1, source_node=0)
+    assert swept.layers == list(range(1, N_LAYERS))
+    for layer in swept.layers:
+        expected = head_loadings(model, graph, run, 1, 0, layer)
+        torch.testing.assert_close(
+            swept.at(layer).per_head, expected.per_head, rtol=1e-4, atol=1e-6
+        )
+        torch.testing.assert_close(swept.at(layer).bypass, expected.bypass, rtol=1e-4, atol=1e-6)
+    torch.testing.assert_close(swept.total, edge_effect(model, graph, run, 1, 0))
+
+
+def test_path_head_loadings_from_a_token_start_at_block_zero():
+    from circuit_tracer.attribution.head_loadings import path_head_loadings
+
+    model, run, graph = make_model(), make_run(), make_graph(*GRAPH_ARGS)
+    token_node = NodeLayout.from_graph(graph).error_end + 2
+    swept = path_head_loadings(model, graph, run, target_node=1, source_node=token_node)
+    assert swept.layers == list(range(0, N_LAYERS))
+    expected = head_loadings(model, graph, run, 1, token_node, 0)
+    torch.testing.assert_close(swept.at(0).per_head, expected.per_head, rtol=1e-4, atol=1e-6)
+
+
+def test_path_head_loadings_leave_gradients_disabled():
+    from circuit_tracer.attribution.head_loadings import path_head_loadings
+
+    model, run, graph = make_model(), make_run(), make_graph(*GRAPH_ARGS)
+    with torch.no_grad():
+        swept = path_head_loadings(model, graph, run, target_node=1, source_node=0)
+        assert not torch.is_grad_enabled()
+    assert not swept.per_head.requires_grad
+
+
+def test_path_head_loadings_reject_a_layer_off_the_path():
+    from circuit_tracer.attribution.head_loadings import path_head_loadings
+
+    swept = path_head_loadings(make_model(), make_graph(*GRAPH_ARGS), make_run(), 1, 0)
+    with pytest.raises(ValueError, match="not on this path"):
+        swept.at(0)
