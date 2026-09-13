@@ -179,3 +179,45 @@ def test_attention_scale_defaults_to_the_square_root_of_d_head():
 
 def test_attention_scale_is_one_when_the_model_disables_it():
     assert qk.attention_scale(make_model(use_attn_scale=False)) == 1.0
+
+
+def test_frozen_scores_restore_the_head_axis_of_qk_norm_scales():
+    run = qk.FrozenScores.from_model(make_model(), torch.arange(N_POS))
+    assert run.n_pos == N_POS
+    assert run.resid_pre[0].shape == (N_POS, D_MODEL)
+    assert run.ln1_scales[0].shape == (N_POS, 1)
+    assert run.query_scales[0].shape == (N_POS, N_HEADS, 1)
+    assert run.key_scales[0].shape == (N_POS, 2, 1)
+
+
+def test_frozen_scores_without_qk_norm_carry_no_scales():
+    run = qk.FrozenScores.from_model(make_model(qk_norm=False), torch.arange(N_POS))
+    assert run.query_scales == [None] * N_LAYERS
+    assert run.key_scales == [None] * N_LAYERS
+
+
+def test_a_batched_cache_is_refused():
+    model = make_model()
+    batched = {name: torch.cat([value, value]) for name, value in reference_cache(model).items()}
+    model.run_with_cache = lambda tokens, names_filter=None: (None, batched)
+    with pytest.raises(ValueError, match="a batch of 2"):
+        qk.FrozenScores.from_model(model, torch.arange(N_POS))
+
+
+def test_rotations_are_orthogonal():
+    rotations = qk.rotation_matrices(make_model(), N_POS)
+    assert rotations is not None and rotations.shape == (N_POS, D_HEAD, D_HEAD)
+    identity = torch.eye(D_HEAD).expand(N_POS, D_HEAD, D_HEAD)
+    torch.testing.assert_close(rotations @ rotations.transpose(1, 2), identity, atol=1e-5, rtol=0)
+
+
+def test_rotations_depend_only_on_the_offset():
+    rotations = qk.rotation_matrices(make_model(), N_POS)
+    assert rotations is not None
+    torch.testing.assert_close(
+        rotations[3] @ rotations[1].T, rotations[4] @ rotations[2].T, atol=1e-5, rtol=0
+    )
+
+
+def test_no_rotations_without_rotary_embeddings():
+    assert qk.rotation_matrices(make_model(rotary=False), N_POS) is None
