@@ -221,3 +221,41 @@ def test_rotations_depend_only_on_the_offset():
 
 def test_no_rotations_without_rotary_embeddings():
     assert qk.rotation_matrices(make_model(rotary=False), N_POS) is None
+
+
+ARCHITECTURES = [
+    {"rotary": False, "qk_norm": False, "kv_heads": 4},
+    {"rotary": True, "qk_norm": False, "kv_heads": 4},
+    {"rotary": False, "qk_norm": True, "kv_heads": 2},
+    {"rotary": True, "qk_norm": True, "kv_heads": 2},
+]
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_scores_match_an_independent_forward_pass(architecture: dict):
+    model = make_model(**architecture)
+    run = qk.FrozenScores.from_model(model, torch.arange(N_POS))
+    for layer in range(N_LAYERS):
+        for head in range(N_HEADS):
+            torch.testing.assert_close(
+                qk.attention_scores(model, run, layer, head),
+                reference_scores(model, layer, head),
+                rtol=1e-4,
+                atol=1e-5,
+            )
+
+
+def test_to_head_space_rejects_an_unknown_side():
+    model = make_model()
+    run = qk.FrozenScores.from_model(model, torch.arange(N_POS))
+    with pytest.raises(ValueError, match="side"):
+        qk.to_head_space(model, run, 0, 0, torch.zeros(1, D_MODEL), torch.zeros(1).long(), side="x")
+
+
+def test_to_head_space_rejects_mismatched_positions():
+    model = make_model()
+    run = qk.FrozenScores.from_model(model, torch.arange(N_POS))
+    with pytest.raises(ValueError, match="positions"):
+        qk.to_head_space(
+            model, run, 0, 0, torch.zeros(2, D_MODEL), torch.zeros(3).long(), side="query"
+        )

@@ -170,3 +170,71 @@ class FrozenScores:
                 queries.append(None)
                 keys.append(None)
         return cls(resid, ln1, queries, keys, rotation_matrices(model, resid[0].shape[0]))
+
+
+def _projection(model, layer: int, head: int, side: str) -> Tensor:
+    """``W_Q diag(w_q)`` or ``W_K diag(w_k)``: the QK-norm gain is a fixed per-channel scaling."""
+    attn = model.blocks[layer].attn
+    weight = attn.W_Q[head] if side == "query" else attn.W_K[head]
+    norm = getattr(attn, "q_norm" if side == "query" else "k_norm", None)
+    return weight * norm.w if norm is not None else weight
+
+
+def to_head_space(
+    model,
+    run: FrozenScores,
+    layer: int,
+    head: int,
+    directions: Tensor,
+    positions: Tensor,
+    *,
+    side: str,
+) -> Tensor:
+    """Carry residual-stream directions into one head's rotated query or key space.
+
+    Applies ``ln1`` in full (gain and frozen division), the projection with its QK-norm gain, the
+    frozen QK-norm scale and the rotation at each direction's position. Every step is linear with
+    the scales frozen, so directions can be projected one at a time and summed afterwards.
+
+    Args:
+        directions: ``(n, d_model)``, in residual-stream coordinates before ``ln1``.
+        positions: ``(n,)``, the position each direction sits at.
+        side: ``"query"`` or ``"key"``.
+
+    Returns:
+        ``(n, d_head)``.
+    """
+    if side not in ("query", "key"):
+        raise ValueError(f"side must be 'query' or 'key', got {side!r}")
+    if directions.ndim != 2:
+        raise ValueError(f"directions must be (n, d_model), got {tuple(directions.shape)}")
+    if positions.shape[0] != directions.shape[0]:
+        raise ValueError(f"{positions.shape[0]} positions for {directions.shape[0]} directions")
+    dtype = directions.dtype
+    gain = model.blocks[layer].ln1.w.to(dtype)
+    out = directions * gain / run.ln1_scales[layer][positions].to(dtype)
+    out = out @ _projection(model, layer, head, side).to(dtype)
+    scales = run.query_scales[layer] if side == "query" else run.key_scales[layer]
+    if scales is not None:
+        index = head if side == "query" else _kv_group(model, head)
+        out = out / scales[positions, index].to(dtype)
+    if run.rotations is not None:
+        out = torch.einsum("na,nab->nb", out, run.rotations[positions].to(dtype))
+    return out
+
+
+def attention_scores(model, run: FrozenScores, layer: int, head: int) -> Tensor:
+    """Reconstruct one head's pre-softmax scores from the frozen run, unmasked.
+
+    Uses the same path as the decomposition, so agreement with the model's own scores is what
+    licenses reading the decomposition as exact.
+
+    Returns:
+        ``(n_pos, n_pos)``, indexed ``[query, key]``.
+    """
+    require_supported(model)
+    residual = run.resid_pre[layer].float()
+    positions = torch.arange(run.n_pos, device=residual.device)
+    query = to_head_space(model, run, layer, head, residual, positions, side="query")
+    key = to_head_space(model, run, layer, head, residual, positions, side="key")
+    return query @ key.T / attention_scale(model)
