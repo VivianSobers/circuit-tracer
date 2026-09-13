@@ -42,8 +42,14 @@ class StubTranscoders(list):
         self.feature_input_hook = "mlp.hook_in"
 
 
-def make_model(*, skip: bool = False, ln_bias: bool = False) -> SimpleNamespace:
-    """A stub with the attributes the split reads, and random weights throughout."""
+def make_model(
+    *, skip: bool = False, ln_bias: bool = False, post_norm: bool = False
+) -> SimpleNamespace:
+    """A stub with the attributes the split reads, and random weights throughout.
+
+    ``post_norm`` adds a normalisation on attention's output before it reaches the residual
+    stream, as Gemma-2 has.
+    """
     generator = torch.Generator().manual_seed(0)
 
     def randn(*shape: int) -> torch.Tensor:
@@ -55,7 +61,10 @@ def make_model(*, skip: bool = False, ln_bias: bool = False) -> SimpleNamespace:
             W_V=randn(N_HEADS, D_MODEL, D_HEAD), W_O=randn(N_HEADS, D_HEAD, D_MODEL)
         )
         norm = lambda: SimpleNamespace(w=randn(D_MODEL), b=randn(D_MODEL) if ln_bias else None)  # noqa: E731
-        blocks.append(SimpleNamespace(attn=attn, ln1=norm(), ln2=norm()))
+        block = SimpleNamespace(attn=attn, ln1=norm(), ln2=norm())
+        if post_norm:
+            block.ln1_post = norm()
+        blocks.append(block)
 
     transcoders = StubTranscoders(
         [
@@ -76,7 +85,7 @@ def make_model(*, skip: bool = False, ln_bias: bool = False) -> SimpleNamespace:
     )
 
 
-def make_run(*, patterns: torch.Tensor | None = None) -> FrozenRun:
+def make_run(*, patterns: torch.Tensor | None = None, post_norm: bool = False) -> FrozenRun:
     """Frozen patterns and scales, causal and normalised as a real run's would be."""
     generator = torch.Generator().manual_seed(1)
     if patterns is None:
@@ -85,11 +94,41 @@ def make_run(*, patterns: torch.Tensor | None = None) -> FrozenRun:
         raw = raw * mask
         patterns = raw / raw.sum(dim=-1, keepdim=True)
     scales = torch.rand(N_POS, 1, generator=generator) + 0.5
+    post = {"ln1_post_scales": [scales.clone() + 1.5 for _ in range(N_LAYERS)]}
     return FrozenRun(
         patterns=list(patterns),
         ln1_scales=[scales.clone() for _ in range(N_LAYERS)],
         ln2_scales=[scales.clone() + 0.25 for _ in range(N_LAYERS)],
+        **(post if post_norm else {}),
     )
+
+
+def reference_edge_effect(
+    model,
+    run: FrozenRun,
+    source,
+    source_position,
+    source_layer,
+    reader,
+    target_position,
+    target_layer,
+) -> torch.Tensor:
+    """The edge effect written out as a plain forward loop, independent of the module's helpers."""
+    state = torch.zeros(N_POS, D_MODEL)
+    state[source_position] = source
+    for layer in range(source_layer + 1, target_layer + 1):
+        block = model.blocks[layer]
+        normalised = state * block.ln1.w / run.ln1_scales[layer]
+        out = torch.zeros(N_POS, D_MODEL)
+        for head in range(N_HEADS):
+            values = normalised @ block.attn.W_V[head]
+            out += (run.patterns[layer][head] @ values) @ block.attn.W_O[head]
+        if hasattr(block, "ln1_post"):
+            assert run.ln1_post_scales is not None
+            out = out * block.ln1_post.w / run.ln1_post_scales[layer]
+        state = state + out
+    final = model.blocks[target_layer].ln2
+    return (state * final.w / run.ln2_scales[target_layer])[target_position] @ reader
 
 
 def make_graph(
@@ -319,3 +358,55 @@ def test_path_head_loadings_reject_a_layer_off_the_path():
     swept = path_head_loadings(make_model(), make_graph(*GRAPH_ARGS), make_run(), 1, 0)
     with pytest.raises(ValueError, match="not on this path"):
         swept.at(0)
+
+
+@pytest.mark.parametrize("post_norm", [False, True])
+def test_the_edge_effect_matches_a_plain_forward_loop(post_norm: bool):
+    """Checked against an independent loop, since the partition alone cannot catch a step that is
+    left out consistently everywhere, such as a norm on attention's output."""
+    model, graph = make_model(post_norm=post_norm), make_graph(*GRAPH_ARGS)
+    run = make_run(post_norm=post_norm)
+    source, source_position, source_layer = source_vector(model, graph, 0)
+    reader, target_position, target_layer = reader_vector(model, graph, 1)
+    expected = reference_edge_effect(
+        model, run, source, source_position, source_layer, reader, target_position, target_layer
+    )
+    torch.testing.assert_close(edge_effect(model, graph, run, 1, 0), expected)
+
+
+def test_a_post_attention_norm_keeps_the_partition_exact():
+    from circuit_tracer.attribution.head_loadings import path_head_loadings
+
+    model, graph = make_model(post_norm=True), make_graph(*GRAPH_ARGS)
+    run = make_run(post_norm=True)
+    whole = edge_effect(model, graph, run, 1, 0)
+    swept = path_head_loadings(model, graph, run, 1, 0)
+    for attention_layer in range(1, N_LAYERS):
+        parts = head_loadings(model, graph, run, 1, 0, attention_layer)
+        torch.testing.assert_close(parts.total, whole)
+        torch.testing.assert_close(
+            swept.at(attention_layer).per_head, parts.per_head, rtol=1e-4, atol=1e-6
+        )
+
+
+def test_a_post_attention_norm_without_its_frozen_scales_is_refused():
+    """Gemma-2 normalises attention's output; without that scale the split would be silently off."""
+    with pytest.raises(UnsupportedForLoadings, match="ln1_post"):
+        edge_effect(make_model(post_norm=True), make_graph(*GRAPH_ARGS), make_run(), 1, 0)
+
+
+def test_the_frozen_run_keeps_post_attention_scales_when_the_model_has_them():
+    class PostNormModel:
+        cfg = SimpleNamespace(n_layers=1, n_heads=N_HEADS)
+
+        def run_with_cache(self, tokens, names_filter=None):
+            return None, {
+                "blocks.0.attn.hook_pattern": torch.zeros(1, N_HEADS, N_POS, N_POS),
+                "blocks.0.ln1.hook_scale": torch.ones(1, N_POS, 1),
+                "blocks.0.ln2.hook_scale": torch.ones(1, N_POS, 1),
+                "blocks.0.ln1_post.hook_scale": torch.full((1, N_POS, 1), 2.0),
+            }
+
+    run = FrozenRun.from_model(PostNormModel(), torch.zeros(1, N_POS, dtype=torch.long))
+    assert run.ln1_post_scales is not None
+    torch.testing.assert_close(run.ln1_post_scales[0], torch.full((N_POS, 1), 2.0))

@@ -150,10 +150,18 @@ class FrozenRun:
     Computing loadings for many edges of the same graph reuses these, so they are gathered once.
     """
 
-    def __init__(self, patterns: list[Tensor], ln1_scales: list[Tensor], ln2_scales: list[Tensor]):
+    def __init__(
+        self,
+        patterns: list[Tensor],
+        ln1_scales: list[Tensor],
+        ln2_scales: list[Tensor],
+        ln1_post_scales: list[Tensor] | None = None,
+    ):
         self.patterns = patterns
         self.ln1_scales = ln1_scales
         self.ln2_scales = ln2_scales
+        # Only models that normalise attention's output before the residual add, such as Gemma-2.
+        self.ln1_post_scales = ln1_post_scales
 
     @property
     def n_pos(self) -> int:
@@ -167,7 +175,7 @@ class FrozenRun:
             model: A ``ReplacementModel`` on the TransformerLens backend.
             tokens: The same prompt the graph was attributed on.
         """
-        wanted = ("attn.hook_pattern", "ln1.hook_scale", "ln2.hook_scale")
+        wanted = ("attn.hook_pattern", "ln1.hook_scale", "ln2.hook_scale", "ln1_post.hook_scale")
         _, cache = model.run_with_cache(
             tokens, names_filter=lambda name: any(name.endswith(tail) for tail in wanted)
         )
@@ -183,10 +191,16 @@ class FrozenRun:
             return value[0]
 
         n_layers = model.cfg.n_layers
+        has_post = "blocks.0.ln1_post.hook_scale" in cache
         return cls(
             patterns=[squeeze(cache[f"blocks.{i}.attn.hook_pattern"]) for i in range(n_layers)],
             ln1_scales=[squeeze(cache[f"blocks.{i}.ln1.hook_scale"]) for i in range(n_layers)],
             ln2_scales=[squeeze(cache[f"blocks.{i}.ln2.hook_scale"]) for i in range(n_layers)],
+            ln1_post_scales=[
+                squeeze(cache[f"blocks.{i}.ln1_post.hook_scale"]) for i in range(n_layers)
+            ]
+            if has_post
+            else None,
         )
 
 
@@ -210,8 +224,8 @@ def _require_supported(model) -> None:
             f"the MLP input, one of {sorted(SUPPORTED_FEATURE_INPUT_HOOKS)}"
         )
     for layer in range(model.cfg.n_layers):
-        for name in ("ln1", "ln2"):
-            norm = getattr(model.blocks[layer], name)
+        for name in ("ln1", "ln2", "ln1_post"):
+            norm = getattr(model.blocks[layer], name, None)
             if getattr(norm, "b", None) is not None:
                 raise UnsupportedForLoadings(
                     f"blocks.{layer}.{name} has a bias, which does not act on a perturbation; "
@@ -238,6 +252,16 @@ def _attention_step(
     values = torch.einsum("pd,hde->hpe", normalised, attn.W_V.to(normalised.dtype))
     moved = torch.einsum("hqp,hpe->hqe", run.patterns[layer].to(values.dtype), values)
     written = torch.einsum("hqe,hed->hqd", moved, attn.W_O.to(moved.dtype))
+    post = getattr(model.blocks[layer], "ln1_post", None)
+    if post is not None:
+        # The norm on attention's output is linear once its scale is frozen, so applying it to
+        # each head's write keeps the per-head split exact.
+        if run.ln1_post_scales is None:
+            raise UnsupportedForLoadings(
+                f"blocks.{layer} normalises attention's output (ln1_post) but the FrozenRun holds "
+                "no ln1_post scales; build it with FrozenRun.from_model on this model"
+            )
+        written = written * post.w.to(written.dtype) / run.ln1_post_scales[layer].to(written.dtype)
     return written if per_head else written.sum(dim=0)
 
 
