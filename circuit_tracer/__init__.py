@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from circuit_tracer.attribution.attribute import attribute
     from circuit_tracer.attribution.head_loadings import FrozenRun, head_loadings
+    from circuit_tracer.attribution.qk_attribution import FrozenScores, qk_attribution
     from circuit_tracer.graph import Graph
     from circuit_tracer.replacement_model import ReplacementModel
 
@@ -12,6 +13,8 @@ __all__ = [
     "attribute",
     "head_loadings",
     "FrozenRun",
+    "qk_attribution",
+    "FrozenScores",
 ]
 
 
@@ -20,6 +23,8 @@ def __getattr__(name):
         "attribute": ("circuit_tracer.attribution.attribute", "attribute"),
         "head_loadings": ("circuit_tracer.attribution.head_loadings", "head_loadings"),
         "FrozenRun": ("circuit_tracer.attribution.head_loadings", "FrozenRun"),
+        "qk_attribution": ("circuit_tracer.attribution.qk_attribution", "qk_attribution"),
+        "FrozenScores": ("circuit_tracer.attribution.qk_attribution", "FrozenScores"),
         "Graph": ("circuit_tracer.graph", "Graph"),
         "ReplacementModel": ("circuit_tracer.replacement_model", "ReplacementModel"),
     }
