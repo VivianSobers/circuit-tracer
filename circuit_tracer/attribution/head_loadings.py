@@ -39,7 +39,9 @@ from circuit_tracer.graph import Graph
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
 
 
-#: Hook points that name the input of an MLP. The readout applies ``ln2`` to reach it, so a
+#: Hook points around a block's ``ln2`` that a transcoder may read, which do not hold the same thing:
+#: ``hook_mlp_in`` is the residual before the norm, ``ln2.hook_normalized`` is divided by the frozen
+#: scale but not yet multiplied by the gain, and ``mlp.hook_in`` is the MLP's input after both. A
 #: transcoder reading anywhere else is refused rather than silently misread.
 SUPPORTED_FEATURE_INPUT_HOOKS = frozenset({"mlp.hook_in", "hook_mlp_in", "ln2.hook_normalized"})
 
@@ -220,8 +222,8 @@ def _require_supported(model) -> None:
     input_hook = getattr(transcoders, "feature_input_hook", "mlp.hook_in")
     if input_hook not in SUPPORTED_FEATURE_INPUT_HOOKS:
         raise UnsupportedForLoadings(
-            f"features read {input_hook!r}; the readout here applies ln2 and so assumes they read "
-            f"the MLP input, one of {sorted(SUPPORTED_FEATURE_INPUT_HOOKS)}"
+            f"features read {input_hook!r}; the readout here models only the hooks around ln2, "
+            f"one of {sorted(SUPPORTED_FEATURE_INPUT_HOOKS)}"
         )
     for layer in range(model.cfg.n_layers):
         for name in ("ln1", "ln2", "ln1_post"):
@@ -273,10 +275,21 @@ def _propagate(model, delta: Tensor, run: FrozenRun, from_layer: int, to_layer: 
     return state
 
 
+def _as_feature_input(model, layer: int, mid: Tensor, run: FrozenRun) -> Tensor:
+    """Turn a perturbation of the residual after attention into what the transcoder's hook holds."""
+    input_hook = getattr(model.transcoders, "feature_input_hook", "mlp.hook_in")
+    if input_hook == "hook_mlp_in":
+        return mid
+    scaled = mid / run.ln2_scales[layer].to(mid.dtype)
+    if input_hook == "ln2.hook_normalized":
+        return scaled
+    return scaled * model.blocks[layer].ln2.w.to(mid.dtype)
+
+
 def _to_feature_input(model, delta: Tensor, run: FrozenRun, layer: int) -> Tensor:
-    """Carry a perturbation of a block's input to what that block's MLP reads."""
+    """Carry a perturbation of a block's input to what that block's transcoder reads."""
     mid = delta + _attention_step(model, layer, delta, run)
-    return _normalised(model, layer, mid, run.ln2_scales[layer], "ln2")
+    return _as_feature_input(model, layer, mid, run)
 
 
 def _seed(source: Tensor, position: int, n_pos: int) -> Tensor:
@@ -397,10 +410,7 @@ def head_loadings(
         )
     readouts = torch.stack(
         [
-            _normalised(model, target_layer, part, run.ln2_scales[target_layer], "ln2")[
-                target_position
-            ]
-            @ reader
+            _as_feature_input(model, target_layer, part, run)[target_position] @ reader
             for part in parts
         ]
     )
@@ -486,13 +496,12 @@ def path_head_loadings(
         # At the target's own block the split happens at the readout, as in head_loadings.
         arriving = states[-1].detach()
         written = _attention_step(model, target_layer, arriving, run, per_head=True)
-        scale = run.ln2_scales[target_layer]
         reader = reader.detach()
         per_head.append(
-            _normalised(model, target_layer, written, scale, "ln2")[:, target_position] @ reader
+            _as_feature_input(model, target_layer, written, run)[:, target_position] @ reader
         )
         bypass.append(
-            _normalised(model, target_layer, arriving, scale, "ln2")[target_position] @ reader
+            _as_feature_input(model, target_layer, arriving, run)[target_position] @ reader
         )
         return PathHeadLoadings(
             layers=list(range(first, target_layer + 1)),

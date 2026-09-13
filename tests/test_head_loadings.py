@@ -127,8 +127,17 @@ def reference_edge_effect(
             assert run.ln1_post_scales is not None
             out = out * block.ln1_post.w / run.ln1_post_scales[layer]
         state = state + out
+    # What the transcoder reads depends on its hook: the residual before ln2, ln2's output before
+    # its gain, or the MLP's input after the gain.
+    hook = model.transcoders.feature_input_hook
     final = model.blocks[target_layer].ln2
-    return (state * final.w / run.ln2_scales[target_layer])[target_position] @ reader
+    if hook == "hook_mlp_in":
+        read = state
+    elif hook == "ln2.hook_normalized":
+        read = state / run.ln2_scales[target_layer]
+    else:
+        read = state * final.w / run.ln2_scales[target_layer]
+    return read[target_position] @ reader
 
 
 def make_graph(
@@ -251,15 +260,8 @@ def test_a_layernorm_bias_is_refused():
 def test_a_feature_input_hook_off_the_mlp_is_refused():
     model = make_model()
     model.transcoders.feature_input_hook = "hook_resid_mid"
-    with pytest.raises(UnsupportedForLoadings, match="assumes they read"):
+    with pytest.raises(UnsupportedForLoadings, match="models only the hooks around ln2"):
         edge_effect(model, make_graph(*GRAPH_ARGS), make_run(), 1, 0)
-
-
-def test_an_equivalent_feature_input_hook_is_accepted():
-    """Backends spell the MLP input differently; all the spellings mean the same readout."""
-    model = make_model()
-    model.transcoders.feature_input_hook = "ln2.hook_normalized"
-    assert edge_effect(model, make_graph(*GRAPH_ARGS), make_run(), 1, 0).ndim == 0
 
 
 def test_activations_are_indexed_by_active_feature_not_by_selection():
@@ -360,11 +362,17 @@ def test_path_head_loadings_reject_a_layer_off_the_path():
         swept.at(0)
 
 
+INPUT_HOOKS = ["mlp.hook_in", "ln2.hook_normalized", "hook_mlp_in"]
+
+
+@pytest.mark.parametrize("input_hook", INPUT_HOOKS)
 @pytest.mark.parametrize("post_norm", [False, True])
-def test_the_edge_effect_matches_a_plain_forward_loop(post_norm: bool):
+def test_the_edge_effect_matches_a_plain_forward_loop(post_norm: bool, input_hook: str):
     """Checked against an independent loop, since the partition alone cannot catch a step that is
-    left out consistently everywhere, such as a norm on attention's output."""
+    left out consistently everywhere, such as a norm on attention's output or a gain the
+    transcoder never sees."""
     model, graph = make_model(post_norm=post_norm), make_graph(*GRAPH_ARGS)
+    model.transcoders.feature_input_hook = input_hook
     run = make_run(post_norm=post_norm)
     source, source_position, source_layer = source_vector(model, graph, 0)
     reader, target_position, target_layer = reader_vector(model, graph, 1)
@@ -372,6 +380,32 @@ def test_the_edge_effect_matches_a_plain_forward_loop(post_norm: bool):
         model, run, source, source_position, source_layer, reader, target_position, target_layer
     )
     torch.testing.assert_close(edge_effect(model, graph, run, 1, 0), expected)
+
+
+@pytest.mark.parametrize("input_hook", INPUT_HOOKS)
+def test_every_readout_keeps_the_partition_exact(input_hook: str):
+    """head_loadings and the single sweep each read at the target on their own, so every input hook
+    is checked at every split point, the target layer included."""
+    from circuit_tracer.attribution.head_loadings import path_head_loadings
+
+    model, graph, run = make_model(), make_graph(*GRAPH_ARGS), make_run()
+    model.transcoders.feature_input_hook = input_hook
+    whole = edge_effect(model, graph, run, 1, 0)
+    source, source_position, source_layer = source_vector(model, graph, 0)
+    reader, target_position, target_layer = reader_vector(model, graph, 1)
+    torch.testing.assert_close(
+        whole,
+        reference_edge_effect(
+            model, run, source, source_position, source_layer, reader, target_position, target_layer
+        ),
+    )
+    swept = path_head_loadings(model, graph, run, 1, 0)
+    for attention_layer in range(1, N_LAYERS):
+        parts = head_loadings(model, graph, run, 1, 0, attention_layer)
+        torch.testing.assert_close(parts.total, whole)
+        torch.testing.assert_close(
+            swept.at(attention_layer).per_head, parts.per_head, rtol=1e-4, atol=1e-6
+        )
 
 
 def test_a_post_attention_norm_keeps_the_partition_exact():
