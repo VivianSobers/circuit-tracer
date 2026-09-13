@@ -384,3 +384,95 @@ def head_loadings(
     return HeadLoadings(
         per_head=readouts[:n_heads], bypass=readouts[n_heads], attention_layer=attention_layer
     )
+
+
+@dataclass(frozen=True)
+class PathHeadLoadings:
+    """Every attention layer's split of one edge, computed together.
+
+    Row ``i`` of ``per_head`` and entry ``i`` of ``bypass`` belong to ``layers[i]``. Each row is its
+    own partition of ``total``; the rows are not parts of one joint decomposition.
+    """
+
+    layers: list[int]
+    per_head: Tensor
+    bypass: Tensor
+    total: Tensor
+
+    def at(self, layer: int) -> HeadLoadings:
+        """The split at one attention layer, in the form :func:`head_loadings` returns."""
+        if layer not in self.layers:
+            raise ValueError(f"layer {layer} is not on this path, which covers {self.layers}")
+        row = self.layers.index(layer)
+        return HeadLoadings(
+            per_head=self.per_head[row], bypass=self.bypass[row], attention_layer=layer
+        )
+
+
+def path_head_loadings(
+    model,
+    graph: Graph,
+    run: FrozenRun,
+    target_node: int,
+    source_node: int,
+) -> PathHeadLoadings:
+    """Split one edge at every attention layer on its path, in a single sweep each way.
+
+    Calling :func:`head_loadings` once per layer re-propagates every head's part from that layer
+    to the target, on the order of ``L**2 * n_heads`` attention steps for a path ``L`` layers long.
+    The map is linear, so the readout is a fixed linear functional of the perturbation entering
+    each layer: one forward sweep gives the perturbation, one backward sweep gives the functional,
+    and each head's loading is a dot product.
+
+    Returns:
+        A :class:`PathHeadLoadings` over every layer from just after the source to the target
+        inclusive, each row agreeing with :func:`head_loadings` for that layer.
+    """
+    _require_supported(model)
+    source, source_position, source_layer = source_vector(model, graph, source_node)
+    reader, target_position, target_layer = reader_vector(model, graph, target_node)
+    if target_layer <= source_layer:
+        raise ValueError(
+            f"target_layer must come after source_layer, got {source_layer} and {target_layer}"
+        )
+    first = source_layer + 1
+
+    # autograd.grad rather than backward, so nothing accumulates on the model's parameters, and grad
+    # mode is restored for callers that turned it off.
+    with torch.enable_grad():
+        seed = _seed(source.detach(), source_position, run.n_pos).requires_grad_(True)
+        states = [seed]
+        for layer in range(first, target_layer):
+            states.append(states[-1] + _attention_step(model, layer, states[-1], run))
+        readout = (
+            _to_feature_input(model, states[-1], run, target_layer)[target_position]
+            @ reader.detach()
+        )
+        sensitivities = torch.autograd.grad(readout, states)
+
+    with torch.no_grad():
+        per_head, bypass = [], []
+        for offset, layer in enumerate(range(first, target_layer)):
+            arriving = states[offset].detach()
+            written = _attention_step(model, layer, arriving, run, per_head=True)
+            onward = sensitivities[offset + 1]
+            per_head.append(torch.einsum("hpd,pd->h", written, onward))
+            bypass.append((arriving * onward).sum())
+
+        # At the target's own block the split happens at the readout, as in head_loadings.
+        arriving = states[-1].detach()
+        written = _attention_step(model, target_layer, arriving, run, per_head=True)
+        scale = run.ln2_scales[target_layer]
+        reader = reader.detach()
+        per_head.append(
+            _normalised(model, target_layer, written, scale, "ln2")[:, target_position] @ reader
+        )
+        bypass.append(
+            _normalised(model, target_layer, arriving, scale, "ln2")[target_position] @ reader
+        )
+        return PathHeadLoadings(
+            layers=list(range(first, target_layer + 1)),
+            per_head=torch.stack(per_head),
+            bypass=torch.stack(bypass),
+            total=readout.detach(),
+        )
