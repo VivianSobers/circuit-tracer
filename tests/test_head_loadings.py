@@ -1,0 +1,252 @@
+"""Tests for splitting an attribution-graph edge across attention heads.
+
+These use a stub standing in for a ReplacementModel, so they need no weights and no GPU. The
+property that matters is a partition: the per-head parts plus the bypass must reproduce the edge
+effect exactly, for every attention layer between the source and the target.
+"""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from transformer_lens import HookedTransformerConfig
+
+from circuit_tracer.attribution.head_loadings import (
+    FrozenRun,
+    HeadLoadings,
+    NodeKind,
+    NodeLayout,
+    UnsupportedForLoadings,
+    edge_effect,
+    head_loadings,
+    reader_vector,
+    source_vector,
+)
+from circuit_tracer.attribution.targets import LogitTarget
+from circuit_tracer.graph import Graph
+
+N_LAYERS = 4
+N_HEADS = 3
+D_MODEL = 8
+D_HEAD = 4
+N_POS = 5
+D_TRANSCODER = 6
+
+
+class StubTranscoders(list):
+    """Stands in for a TranscoderSet, which is indexable by layer."""
+
+    def __init__(self, items, *, skip_connection: bool = False):
+        super().__init__(items)
+        self.skip_connection = skip_connection
+        self.feature_input_hook = "mlp.hook_in"
+
+
+def make_model(*, skip: bool = False, ln_bias: bool = False) -> SimpleNamespace:
+    """A stub with the attributes the split reads, and random weights throughout."""
+    generator = torch.Generator().manual_seed(0)
+
+    def randn(*shape: int) -> torch.Tensor:
+        return torch.randn(*shape, generator=generator)
+
+    blocks = []
+    for _ in range(N_LAYERS):
+        attn = SimpleNamespace(
+            W_V=randn(N_HEADS, D_MODEL, D_HEAD), W_O=randn(N_HEADS, D_HEAD, D_MODEL)
+        )
+        norm = lambda: SimpleNamespace(w=randn(D_MODEL), b=randn(D_MODEL) if ln_bias else None)  # noqa: E731
+        blocks.append(SimpleNamespace(attn=attn, ln1=norm(), ln2=norm()))
+
+    transcoders = StubTranscoders(
+        [
+            SimpleNamespace(
+                W_enc=randn(D_TRANSCODER, D_MODEL),
+                W_dec=randn(D_TRANSCODER, D_MODEL),
+                W_skip=randn(D_MODEL, D_MODEL) if skip else None,
+            )
+            for _ in range(N_LAYERS)
+        ],
+        skip_connection=skip,
+    )
+    return SimpleNamespace(
+        cfg=SimpleNamespace(n_layers=N_LAYERS, n_heads=N_HEADS, d_model=D_MODEL),
+        blocks=blocks,
+        transcoders=transcoders,
+        W_E=randn(16, D_MODEL),
+    )
+
+
+def make_run(*, patterns: torch.Tensor | None = None) -> FrozenRun:
+    """Frozen patterns and scales, causal and normalised as a real run's would be."""
+    generator = torch.Generator().manual_seed(1)
+    if patterns is None:
+        raw = torch.rand(N_LAYERS, N_HEADS, N_POS, N_POS, generator=generator)
+        mask = torch.tril(torch.ones(N_POS, N_POS))
+        raw = raw * mask
+        patterns = raw / raw.sum(dim=-1, keepdim=True)
+    scales = torch.rand(N_POS, 1, generator=generator) + 0.5
+    return FrozenRun(
+        patterns=list(patterns),
+        ln1_scales=[scales.clone() for _ in range(N_LAYERS)],
+        ln2_scales=[scales.clone() + 0.25 for _ in range(N_LAYERS)],
+    )
+
+
+def make_graph(
+    active: list[tuple[int, int, int]],
+    selected: list[int],
+    activations: list[float],
+) -> Graph:
+    """A graph carrying only what the split reads: the feature table and the layout."""
+    n_features = len(selected)
+    total = n_features + N_LAYERS * N_POS + N_POS + 1
+    cfg = HookedTransformerConfig(
+        n_layers=N_LAYERS, d_model=D_MODEL, n_ctx=N_POS, d_head=D_HEAD, n_heads=N_HEADS, d_vocab=16
+    )
+    return Graph(
+        input_string="stub",
+        input_tokens=torch.arange(N_POS),
+        active_features=torch.tensor(active),
+        adjacency_matrix=torch.zeros(total, total),
+        cfg=cfg,
+        selected_features=torch.tensor(selected),
+        activation_values=torch.tensor(activations),
+        logit_targets=[LogitTarget(token_str="x", vocab_idx=0)],
+        logit_probabilities=torch.tensor([1.0]),
+    )
+
+
+# Two features: node 0 is written by layer 0 at position 1, node 1 is read by layer 3 at position 4.
+ACTIVE = [(0, 1, 2), (3, 4, 5)]
+GRAPH_ARGS = (ACTIVE, [0, 1], [3.0, 7.0])
+
+
+def test_the_parts_sum_to_the_edge_effect():
+    """The partition property, which is the whole claim this module makes."""
+    model, run, graph = make_model(), make_run(), make_graph(*GRAPH_ARGS)
+    whole = edge_effect(model, graph, run, target_node=1, source_node=0)
+    for attention_layer in range(1, N_LAYERS):
+        parts = head_loadings(model, graph, run, 1, 0, attention_layer)
+        torch.testing.assert_close(parts.total, whole)
+
+
+def test_every_head_is_accounted_for():
+    parts = head_loadings(make_model(), make_graph(*GRAPH_ARGS), make_run(), 1, 0, 2)
+    assert parts.per_head.shape == (N_HEADS,)
+    assert parts.bypass.ndim == 0
+    assert parts.attention_layer == 2
+
+
+def test_a_head_with_no_output_weights_carries_nothing():
+    model, run, graph = make_model(), make_run(), make_graph(*GRAPH_ARGS)
+    model.blocks[2].attn.W_O[1] = 0.0
+    parts = head_loadings(model, graph, run, 1, 0, 2)
+    assert parts.per_head[1] == 0.0
+    assert parts.per_head[0] != 0.0
+
+
+def test_the_bypass_carries_everything_when_no_head_writes():
+    model, run, graph = make_model(), make_run(), make_graph(*GRAPH_ARGS)
+    model.blocks[2].attn.W_O[:] = 0.0
+    parts = head_loadings(model, graph, run, 1, 0, 2)
+    torch.testing.assert_close(parts.per_head, torch.zeros(N_HEADS))
+    torch.testing.assert_close(parts.bypass, parts.total)
+
+
+def test_ranked_orders_heads_by_magnitude():
+    parts = HeadLoadings(torch.tensor([0.1, -0.9, 0.4]), torch.tensor(0.0), 1)
+    order, values = parts.ranked()
+    assert order.tolist() == [1, 2, 0]
+    torch.testing.assert_close(values, torch.tensor([-0.9, 0.4, 0.1]))
+
+
+@pytest.mark.parametrize("attention_layer", [0, 4, -1])
+def test_an_attention_layer_outside_the_path_is_rejected(attention_layer: int):
+    with pytest.raises(ValueError, match="attention_layer must lie"):
+        head_loadings(make_model(), make_graph(*GRAPH_ARGS), make_run(), 1, 0, attention_layer)
+
+
+def test_the_target_layer_is_a_valid_split_point():
+    """The target reads after its own block's attention, so its layer counts."""
+    model, run, graph = make_model(), make_run(), make_graph(*GRAPH_ARGS)
+    parts = head_loadings(model, graph, run, 1, 0, N_LAYERS - 1)
+    torch.testing.assert_close(parts.total, edge_effect(model, graph, run, 1, 0))
+
+
+def test_a_token_embedding_works_as_a_source():
+    model, run, graph = make_model(), make_run(), make_graph(*GRAPH_ARGS)
+    token_node = NodeLayout.from_graph(graph).error_end + 2
+    vector, position, layer = source_vector(model, graph, token_node)
+    assert position == 2
+    assert layer == -1
+    torch.testing.assert_close(vector, model.W_E[2])
+    parts = head_loadings(model, graph, run, 1, token_node, 1)
+    torch.testing.assert_close(parts.total, edge_effect(model, graph, run, 1, token_node))
+
+
+def test_an_error_source_is_refused_rather_than_guessed():
+    graph = make_graph(*GRAPH_ARGS)
+    error_node = len(graph.selected_features)
+    with pytest.raises(UnsupportedForLoadings, match="error nodes"):
+        source_vector(make_model(), graph, error_node)
+
+
+def test_a_non_feature_target_is_refused():
+    graph = make_graph(*GRAPH_ARGS)
+    logit_node = NodeLayout.from_graph(graph).token_end
+    with pytest.raises(ValueError, match="target must be a feature node"):
+        reader_vector(make_model(), graph, logit_node)
+
+
+def test_skip_transcoders_are_refused():
+    """With a skip connection an MLP's output moves when its input does, so no path is frozen."""
+    with pytest.raises(UnsupportedForLoadings, match="skip connection"):
+        edge_effect(make_model(skip=True), make_graph(*GRAPH_ARGS), make_run(), 1, 0)
+
+
+def test_a_layernorm_bias_is_refused():
+    with pytest.raises(UnsupportedForLoadings, match="has a bias"):
+        edge_effect(make_model(ln_bias=True), make_graph(*GRAPH_ARGS), make_run(), 1, 0)
+
+
+def test_a_feature_input_hook_off_the_mlp_is_refused():
+    model = make_model()
+    model.transcoders.feature_input_hook = "hook_resid_mid"
+    with pytest.raises(UnsupportedForLoadings, match="assumes they read the MLP input"):
+        edge_effect(model, make_graph(*GRAPH_ARGS), make_run(), 1, 0)
+
+
+def test_activations_are_indexed_by_active_feature_not_by_selection():
+    """activation_values is aligned with active_features; the two coincide only when nothing
+    is pruned, which is how the mismatch stays invisible on small graphs."""
+    active = [(0, 1, 2), (1, 2, 3), (3, 4, 5)]
+    graph = make_graph(active, [0, 2], [3.0, 99.0, 7.0])
+    model = make_model()
+    vector, _, _ = source_vector(model, graph, 0)
+    torch.testing.assert_close(vector, model.transcoders[0].W_dec[2] * 3.0)
+    reader, position, layer = reader_vector(model, graph, 1)
+    assert (position, layer) == (4, 3)
+    torch.testing.assert_close(reader, model.transcoders[3].W_enc[5])
+
+
+def test_node_layout_regions_are_contiguous():
+    layout = NodeLayout.from_graph(make_graph(*GRAPH_ARGS))
+    assert layout.kind(0) is NodeKind.FEATURE
+    assert layout.kind(layout.n_features) is NodeKind.ERROR
+    assert layout.kind(layout.error_end) is NodeKind.TOKEN
+    assert layout.kind(layout.token_end) is NodeKind.LOGIT
+    assert layout.decode_error(layout.n_features + N_POS + 3) == (1, 3)
+    assert layout.decode_token(layout.error_end + 4) == 4
+
+
+def test_an_out_of_range_node_raises():
+    layout = NodeLayout.from_graph(make_graph(*GRAPH_ARGS))
+    with pytest.raises(IndexError, match="out of range"):
+        layout.kind(layout.total)
+
+
+def test_an_inconsistent_adjacency_matrix_is_reported():
+    graph = make_graph(*GRAPH_ARGS)
+    graph.adjacency_matrix = torch.zeros(7, 7)
+    with pytest.raises(ValueError, match="inconsistent with the graph"):
+        NodeLayout.from_graph(graph)
