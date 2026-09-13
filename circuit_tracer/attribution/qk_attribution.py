@@ -338,3 +338,93 @@ def remainder_sources(run: FrozenScores, sources: SourceSet, layer: int) -> Sour
     seq, device = remainder.shape[0], remainder.device
     marker = torch.full((seq,), REMAINDER, dtype=torch.long, device=device)
     return SourceSet(remainder, torch.arange(seq, device=device), marker, marker.clone())
+
+
+@dataclass(frozen=True)
+class QKAttribution:
+    """One head's score from one query position, expanded into (query source, key source) terms."""
+
+    contributions: Tensor
+    query_sources: SourceSet
+    key_sources: SourceSet
+    layer: int
+    head: int
+    query_position: int
+
+    @property
+    def by_key_source(self) -> Tensor:
+        return self.contributions.sum(dim=0)
+
+    @property
+    def by_query_source(self) -> Tensor:
+        return self.contributions.sum(dim=1)
+
+    def by_key_position(self, n_pos: int) -> Tensor:
+        """The score at each key position, which compares against a row of the score matrix.
+
+        Accumulated in float32: many terms of both signs land on each position.
+        """
+        totals = torch.zeros(n_pos, dtype=torch.float32, device=self.contributions.device)
+        if len(self.key_sources):
+            totals.index_add_(0, self.key_sources.positions, self.by_key_source.float())
+        return totals
+
+    def top_pairs(self, count: int) -> tuple[Tensor, Tensor]:
+        """The ``count`` largest terms by magnitude, signed, with flat indices.
+
+        Use ``divmod(index, contributions.shape[1])`` to recover the query and key source rows.
+        """
+        flat = self.contributions.flatten()
+        _, indices = flat.abs().topk(min(count, flat.numel()))
+        return flat[indices], indices
+
+
+def qk_attribution(
+    model,
+    graph: Graph,
+    run: FrozenScores,
+    layer: int,
+    head: int,
+    query_position: int,
+) -> QKAttribution:
+    """Expand one head's score from one query position into source-pair terms.
+
+    Sources are the graph's selected features written below ``layer`` plus one remainder per
+    position, so the terms for each key position sum to that entry of the score matrix. Over all
+    query positions at once the contraction grows too large to hold, which is why this takes one.
+
+    Args:
+        model: A ``ReplacementModel`` on the TransformerLens backend.
+        graph: The attribution graph for the prompt ``run`` was captured on.
+        run: A :class:`FrozenScores` for that prompt.
+        layer: The attention layer.
+        head: The query head.
+        query_position: The attending position.
+    """
+    require_supported(model)
+    if not 0 <= layer < model.cfg.n_layers:
+        raise IndexError(f"layer {layer} out of range for {model.cfg.n_layers} layers")
+    if not 0 <= head < model.cfg.n_heads:
+        raise IndexError(f"head {head} out of range for {model.cfg.n_heads} heads")
+    if not 0 <= query_position < run.n_pos:
+        raise IndexError(f"query_position {query_position} out of range for {run.n_pos} positions")
+
+    features = feature_sources(model, graph, below_layer=layer)
+    sources = features.concat(remainder_sources(run, features, layer))
+    query_sources = sources.select(sources.positions == query_position)
+    key_sources = sources.select(sources.positions <= query_position)
+
+    left = to_head_space(
+        model, run, layer, head, query_sources.directions, query_sources.positions, side="query"
+    )
+    right = to_head_space(
+        model, run, layer, head, key_sources.directions, key_sources.positions, side="key"
+    )
+    return QKAttribution(
+        contributions=left @ right.T / attention_scale(model),
+        query_sources=query_sources,
+        key_sources=key_sources,
+        layer=layer,
+        head=head,
+        query_position=query_position,
+    )

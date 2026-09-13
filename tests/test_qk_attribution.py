@@ -293,3 +293,59 @@ def test_sources_and_the_remainder_reconstruct_the_residual():
     rebuilt = torch.zeros(N_POS, D_MODEL).index_add_(0, sources.positions, sources.directions)
     torch.testing.assert_close(rebuilt, run.resid_pre[2], rtol=1e-5, atol=1e-5)
     assert int(sources.is_remainder.sum()) == N_POS
+
+
+GRAPH_FEATURES = ([(0, 1, 2), (0, 5, 3), (1, 4, 5), (1, 5, 1), (2, 3, 7)], [0, 1, 2, 3, 4])
+ACTIVATIONS = [2.0, -1.0, 0.5, 1.5, 3.0]
+
+
+@pytest.mark.parametrize("architecture", ARCHITECTURES)
+def test_contributions_sum_to_the_score_row(architecture: dict):
+    """The whole claim: with the remainder carried, the pairs reproduce the score exactly."""
+    model = make_model(**architecture)
+    run = qk.FrozenScores.from_model(model, torch.arange(N_POS))
+    graph = make_graph(*GRAPH_FEATURES, ACTIVATIONS)
+    for layer in (1, 2):
+        for query_position in (2, N_POS - 1):
+            result = qk.qk_attribution(model, graph, run, layer, 1, query_position)
+            expected = reference_scores(model, layer, 1)[query_position, : query_position + 1]
+            got = result.by_key_position(N_POS)[: query_position + 1]
+            torch.testing.assert_close(got, expected, rtol=1e-4, atol=1e-5)
+
+
+def test_query_sources_all_sit_at_the_query_position():
+    model = make_model()
+    run = qk.FrozenScores.from_model(model, torch.arange(N_POS))
+    result = qk.qk_attribution(model, make_graph(*GRAPH_FEATURES, ACTIVATIONS), run, 2, 0, 5)
+    assert set(result.query_sources.positions.tolist()) == {5}
+    assert int(result.query_sources.is_remainder.sum()) == 1
+
+
+def test_key_sources_never_come_from_later_positions():
+    model = make_model()
+    run = qk.FrozenScores.from_model(model, torch.arange(N_POS))
+    result = qk.qk_attribution(model, make_graph(*GRAPH_FEATURES, ACTIVATIONS), run, 2, 0, 3)
+    assert int(result.key_sources.positions.max()) <= 3
+    assert result.contributions.shape == (len(result.query_sources), len(result.key_sources))
+
+
+def test_top_pairs_are_the_largest_by_magnitude():
+    model = make_model()
+    run = qk.FrozenScores.from_model(model, torch.arange(N_POS))
+    result = qk.qk_attribution(model, make_graph(*GRAPH_FEATURES, ACTIVATIONS), run, 2, 3, 5)
+    values, flat = result.top_pairs(3)
+    torch.testing.assert_close(values, result.contributions.flatten()[flat])
+    third_largest = result.contributions.abs().flatten().sort().values[-3]
+    assert float(values.abs().min()) >= float(third_largest)
+
+
+@pytest.mark.parametrize(
+    ("layer", "head", "query_position", "fragment"),
+    [(N_LAYERS, 0, 0, "layer"), (0, N_HEADS, 0, "head"), (0, 0, N_POS, "query_position")],
+)
+def test_out_of_range_arguments_raise(layer: int, head: int, query_position: int, fragment: str):
+    model = make_model()
+    run = qk.FrozenScores.from_model(model, torch.arange(N_POS))
+    graph = make_graph(*GRAPH_FEATURES, ACTIVATIONS)
+    with pytest.raises(IndexError, match=fragment):
+        qk.qk_attribution(model, graph, run, layer, head, query_position)
