@@ -7,6 +7,7 @@ rather than a restatement.
 """
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -131,8 +132,12 @@ def reference_scores(model: SimpleNamespace, layer: int, head: int) -> torch.Ten
     return q @ k.T / scale
 
 
-def make_graph(active, selected, activations) -> SimpleNamespace:
-    """Only the fields the module reads from a circuit-tracer Graph."""
+def make_graph(active, selected, activations) -> Any:
+    """Only the fields the module reads from a circuit-tracer Graph.
+
+    Typed as Any because it stands in for a Graph, which cannot be built without the
+    backends this test file avoids importing.
+    """
     return SimpleNamespace(
         active_features=torch.tensor(active),
         selected_features=torch.tensor(selected),
@@ -186,8 +191,10 @@ def test_frozen_scores_restore_the_head_axis_of_qk_norm_scales():
     assert run.n_pos == N_POS
     assert run.resid_pre[0].shape == (N_POS, D_MODEL)
     assert run.ln1_scales[0].shape == (N_POS, 1)
-    assert run.query_scales[0].shape == (N_POS, N_HEADS, 1)
-    assert run.key_scales[0].shape == (N_POS, 2, 1)
+    query_scale, key_scale = run.query_scales[0], run.key_scales[0]
+    assert query_scale is not None and key_scale is not None
+    assert query_scale.shape == (N_POS, N_HEADS, 1)
+    assert key_scale.shape == (N_POS, 2, 1)
 
 
 def test_frozen_scores_without_qk_norm_carry_no_scales():
