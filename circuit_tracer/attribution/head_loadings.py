@@ -39,6 +39,11 @@ from circuit_tracer.graph import Graph
 from circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
 
 
+#: Hook points that name the input of an MLP. The readout applies ``ln2`` to reach it, so a
+#: transcoder reading anywhere else is refused rather than silently misread.
+SUPPORTED_FEATURE_INPUT_HOOKS = frozenset({"mlp.hook_in", "hook_mlp_in", "ln2.hook_normalized"})
+
+
 class UnsupportedForLoadings(RuntimeError):
     """Raised when a model or graph breaks the linearity the split relies on."""
 
@@ -168,7 +173,14 @@ class FrozenRun:
         )
 
         def squeeze(value: Tensor) -> Tensor:
-            return value[0] if value.ndim in (3, 4) and value.shape[0] == 1 else value
+            if value.ndim not in (3, 4):
+                return value
+            if value.shape[0] != 1:
+                raise ValueError(
+                    f"expected one prompt but the cache holds a batch of {value.shape[0]}; "
+                    "a graph describes a single prompt"
+                )
+            return value[0]
 
         n_layers = model.cfg.n_layers
         return cls(
@@ -192,9 +204,10 @@ def _require_supported(model) -> None:
             "does even with activations frozen; the split assumes it does not"
         )
     input_hook = getattr(transcoders, "feature_input_hook", "mlp.hook_in")
-    if "mlp" not in input_hook:
+    if input_hook not in SUPPORTED_FEATURE_INPUT_HOOKS:
         raise UnsupportedForLoadings(
-            f"features read {input_hook!r}; the readout here assumes they read the MLP input"
+            f"features read {input_hook!r}; the readout here applies ln2 and so assumes they read "
+            f"the MLP input, one of {sorted(SUPPORTED_FEATURE_INPUT_HOOKS)}"
         )
     for layer in range(model.cfg.n_layers):
         for name in ("ln1", "ln2"):
@@ -350,14 +363,13 @@ def head_loadings(
         arriving = _propagate(model, delta, run, source_layer + 1, attention_layer)
         written = _attention_step(model, attention_layer, arriving, run, per_head=True)
         split = torch.cat([written, arriving.unsqueeze(0)], dim=0)
+        # Each part now travels to the target's block on its own, and the target reads after that
+        # block's own attention, so one more step is applied before the readout.
+        carried = [
+            _propagate(model, piece, run, attention_layer + 1, target_layer) for piece in split
+        ]
         parts = torch.stack(
-            [
-                part + _attention_step(model, target_layer, part, run)
-                for part in (
-                    _propagate(model, piece, run, attention_layer + 1, target_layer)
-                    for piece in split
-                )
-            ]
+            [part + _attention_step(model, target_layer, part, run) for part in carried]
         )
     readouts = torch.stack(
         [

@@ -212,8 +212,15 @@ def test_a_layernorm_bias_is_refused():
 def test_a_feature_input_hook_off_the_mlp_is_refused():
     model = make_model()
     model.transcoders.feature_input_hook = "hook_resid_mid"
-    with pytest.raises(UnsupportedForLoadings, match="assumes they read the MLP input"):
+    with pytest.raises(UnsupportedForLoadings, match="assumes they read"):
         edge_effect(model, make_graph(*GRAPH_ARGS), make_run(), 1, 0)
+
+
+def test_an_equivalent_feature_input_hook_is_accepted():
+    """Backends spell the MLP input differently; all the spellings mean the same readout."""
+    model = make_model()
+    model.transcoders.feature_input_hook = "ln2.hook_normalized"
+    assert edge_effect(model, make_graph(*GRAPH_ARGS), make_run(), 1, 0).ndim == 0
 
 
 def test_activations_are_indexed_by_active_feature_not_by_selection():
@@ -250,3 +257,20 @@ def test_an_inconsistent_adjacency_matrix_is_reported():
     graph.adjacency_matrix = torch.zeros(7, 7)
     with pytest.raises(ValueError, match="inconsistent with the graph"):
         NodeLayout.from_graph(graph)
+
+
+def test_a_batched_cache_is_refused():
+    """A graph describes one prompt, so a batched run would silently misalign every position."""
+
+    class BatchedModel:
+        cfg = SimpleNamespace(n_layers=1, n_heads=N_HEADS)
+
+        def run_with_cache(self, tokens, names_filter=None):
+            return None, {
+                "blocks.0.attn.hook_pattern": torch.zeros(2, N_HEADS, N_POS, N_POS),
+                "blocks.0.ln1.hook_scale": torch.ones(2, N_POS, 1),
+                "blocks.0.ln2.hook_scale": torch.ones(2, N_POS, 1),
+            }
+
+    with pytest.raises(ValueError, match="a batch of 2"):
+        FrozenRun.from_model(BatchedModel(), torch.zeros(2, N_POS, dtype=torch.long))
