@@ -25,9 +25,13 @@ Example:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
+
+if TYPE_CHECKING:
+    from circuit_tracer.graph import Graph
 
 #: Position schemes that leave the score bilinear in the residual stream.
 BILINEAR_POSITION_SCHEMES = frozenset({"standard", "rotary", None})
@@ -238,3 +242,99 @@ def attention_scores(model, run: FrozenScores, layer: int, head: int) -> Tensor:
     query = to_head_space(model, run, layer, head, residual, positions, side="query")
     key = to_head_space(model, run, layer, head, residual, positions, side="key")
     return query @ key.T / attention_scale(model)
+
+
+@dataclass(frozen=True)
+class SourceSet:
+    """Residual-stream directions feeding one attention layer, with where each came from.
+
+    Directions are already scaled by their activations, so summing them by position rebuilds the
+    part of the residual stream they account for.
+    """
+
+    directions: Tensor
+    positions: Tensor
+    layers: Tensor
+    feature_ids: Tensor
+
+    def __len__(self) -> int:
+        return int(self.directions.shape[0])
+
+    def concat(self, other: SourceSet) -> SourceSet:
+        return SourceSet(
+            directions=torch.cat([self.directions, other.directions.to(self.directions.dtype)]),
+            positions=torch.cat([self.positions, other.positions]),
+            layers=torch.cat([self.layers, other.layers]),
+            feature_ids=torch.cat([self.feature_ids, other.feature_ids]),
+        )
+
+    def select(self, keep: Tensor) -> SourceSet:
+        return SourceSet(
+            directions=self.directions[keep],
+            positions=self.positions[keep],
+            layers=self.layers[keep],
+            feature_ids=self.feature_ids[keep],
+        )
+
+    @property
+    def is_remainder(self) -> Tensor:
+        """Rows standing for what no transcoder feature explains."""
+        return self.layers == REMAINDER
+
+
+def _activations_for(graph: Graph) -> Tensor:
+    """Each selected feature's activation, checking which table ``activation_values`` follows."""
+    selected = graph.selected_features
+    values = graph.activation_values
+    if len(values) == len(graph.active_features):
+        return values[selected]
+    if len(values) == len(selected):
+        return values
+    raise ValueError(
+        f"activation_values has {len(values)} entries, matching neither active_features "
+        f"({len(graph.active_features)}) nor selected_features ({len(selected)})"
+    )
+
+
+def feature_sources(model, graph: Graph, *, below_layer: int, dtype=torch.float32) -> SourceSet:
+    """Activation-scaled decoder directions of every selected feature written below a layer.
+
+    A per-layer transcoder feature writes at its own block's MLP output, so attention at a later
+    block sees it and attention at its own block does not. Directions are extracted in float32 by
+    default: the contraction sums many terms that largely cancel, and bfloat16 loses most of the
+    result. Decoder rows are gathered one layer at a time, since a lazily loaded decoder can re-read
+    the layer from disk on every access.
+    """
+    active = graph.active_features[graph.selected_features]
+    values = _activations_for(graph)
+    keep = active[:, 0] < below_layer
+    template = model.transcoders[0].W_dec
+    device = template.device
+    layers = active[keep, 0].to(device)
+    positions = active[keep, 1].to(device)
+    feature_ids = active[keep, 2].to(device)
+    directions = torch.empty((int(keep.sum()), template.shape[-1]), dtype=dtype, device=device)
+    for layer in layers.unique().tolist():
+        rows = layers == layer
+        directions[rows] = model.transcoders[layer].W_dec[feature_ids[rows]].to(dtype)
+    directions = directions * values[keep].to(device=device, dtype=dtype).unsqueeze(-1)
+    return SourceSet(directions, positions, layers, feature_ids)
+
+
+def remainder_sources(run: FrozenScores, sources: SourceSet, layer: int) -> SourceSet:
+    """What the given sources leave out of the residual entering ``layer``, one row per position.
+
+    Transcoder features cover only MLP writes. Earlier attention outputs, embeddings, transcoder
+    errors and decoder biases are in the residual too; carrying them as one lumped direction per
+    position keeps the decomposition exhaustive and makes the features' share visible.
+    """
+    remainder = run.resid_pre[layer].to(torch.float32).clone()
+    if len(sources):
+        remainder.index_add_(
+            0,
+            sources.positions.to(remainder.device),
+            -sources.directions.to(device=remainder.device, dtype=remainder.dtype),
+        )
+    seq, device = remainder.shape[0], remainder.device
+    marker = torch.full((seq,), REMAINDER, dtype=torch.long, device=device)
+    return SourceSet(remainder, torch.arange(seq, device=device), marker, marker.clone())

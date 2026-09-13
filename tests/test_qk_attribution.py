@@ -259,3 +259,37 @@ def test_to_head_space_rejects_mismatched_positions():
         qk.to_head_space(
             model, run, 0, 0, torch.zeros(2, D_MODEL), torch.zeros(3).long(), side="query"
         )
+
+
+def test_activations_follow_active_features_on_a_pruned_graph():
+    """activation_values is aligned with active_features; the two coincide only when nothing is
+    pruned, which is how indexing it by selection stays invisible on small graphs."""
+    model = make_model()
+    graph = make_graph([(0, 1, 2), (0, 3, 4), (1, 2, 5)], [0, 2], [3.0, 99.0, 7.0])
+    sources = qk.feature_sources(model, graph, below_layer=2)
+    torch.testing.assert_close(sources.directions[0], model.transcoders[0].W_dec[2] * 3.0)
+    torch.testing.assert_close(sources.directions[1], model.transcoders[1].W_dec[5] * 7.0)
+
+
+def test_activation_values_matching_neither_table_are_rejected():
+    graph = make_graph([(0, 1, 2), (0, 3, 4), (1, 2, 5)], [0, 2], [3.0, 7.0, 1.0, 1.0])
+    with pytest.raises(ValueError, match="matching neither"):
+        qk.feature_sources(make_model(), graph, below_layer=2)
+
+
+def test_only_features_written_below_the_layer_are_sources():
+    graph = make_graph([(0, 1, 2), (1, 3, 4), (2, 2, 5)], [0, 1, 2], [1.0, 1.0, 1.0])
+    sources = qk.feature_sources(make_model(), graph, below_layer=2)
+    assert sources.layers.tolist() == [0, 1]
+    assert sources.directions.dtype == torch.float32
+
+
+def test_sources_and_the_remainder_reconstruct_the_residual():
+    model = make_model()
+    run = qk.FrozenScores.from_model(model, torch.arange(N_POS))
+    graph = make_graph([(0, 1, 2), (0, 1, 3), (1, 4, 5)], [0, 1, 2], [2.0, -1.5, 0.5])
+    features = qk.feature_sources(model, graph, below_layer=2)
+    sources = features.concat(qk.remainder_sources(run, features, 2))
+    rebuilt = torch.zeros(N_POS, D_MODEL).index_add_(0, sources.positions, sources.directions)
+    torch.testing.assert_close(rebuilt, run.resid_pre[2], rtol=1e-5, atol=1e-5)
+    assert int(sources.is_remainder.sum()) == N_POS
